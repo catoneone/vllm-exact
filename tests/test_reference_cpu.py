@@ -1,4 +1,4 @@
-"""CPU 上能跑的参考实现自检（不需要 GPU、Triton、vLLM）：python -m pytest tests/test_reference_cpu.py"""
+"""Self-checks of the reference implementation on CPU (no GPU, Triton or vLLM): python -m pytest tests/test_reference_cpu.py"""
 import torch
 
 from vllm_exact import kernels as K
@@ -8,7 +8,7 @@ def _xw(M=7, N=33, Kd=512, seed=0, outlier=True):
     g = torch.Generator().manual_seed(seed)
     x = torch.randn(M, Kd, generator=g)
     if outlier:
-        x[:, 3] *= 500  # 每行一个大值，检验按行缩放
+        x[:, 3] *= 500  # one large value per row, to exercise per-row scaling
     w = torch.randn(N, Kd, generator=g) * 0.02
     return x, w
 
@@ -24,7 +24,8 @@ def test_digitize_reconstructs():
 
 
 def test_exact_linear_close_to_float():
-    """没有离群值时误差在 1e-3 以内。有离群值时，按行缩放会让同一行的小值变粗（定点方案的固有代价）。"""
+    """Without outliers the error is below 1e-3. With outliers, per-row scaling makes small values in the same row coarser
+    (an inherent cost of the fixed-point scheme)."""
     x, w = _xw(outlier=False)
     ref = x.double() @ w.double().T
     for F, tr in ((15, False), (14, True)):
@@ -34,7 +35,8 @@ def test_exact_linear_close_to_float():
 
 
 def test_rows_independent():
-    """每行的结果只取决于这一行：单独算和放进批里算逐位相同（批组成无关的根本原因）。"""
+    """Each row's result depends only on that row: alone or inside a batch gives the same bits (the root of batch
+    invariance)."""
     x, w = _xw(M=9)
     for F, tr in ((15, False), (14, True)):
         wd = K.digitize_torch(w, F)
@@ -45,7 +47,8 @@ def test_rows_independent():
 
 
 def test_k_split_is_exact():
-    """把 K 拆成几段分别做整数累加再相加，和不拆逐位相同（split-K 的依据）。"""
+    """Splitting K into pieces, accumulating each in integers and adding them gives the same bits as no split (the basis
+    of split-K)."""
     x, w = _xw(Kd=1024)
     F = 14
     xd, wd = K.digitize_torch(x, F), K.digitize_torch(w, F)

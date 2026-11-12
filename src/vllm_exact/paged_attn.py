@@ -1,26 +1,31 @@
-"""分页 KV 缓存上的 bf16x2 decode 注意力 kernel，以及给 vLLM FlashAttention 后端打的补丁。
+"""bf16x2 decode attention over vLLM's paged KV cache, and a patch for vLLM's FlashAttention backend.
 
-kernel：每个（请求, KV 头, SPLIT 个 key 一段）一个程序；段长固定、段数按模型最大长度固定（与批无关，CUDA graph 回放时网格不变），
-  段间按固定顺序合并。
-  QKᵀ：q、K 都是 bf16 → 一次 bf16 dot，乘积在 fp32 里精确；softmax 权重 p 拆成高低两半 → 两次 bf16 dot × V（bf16，精确）。
-  KV 布局沿用 vLLM FlashAttention：kv_cache [num_blocks, num_kv_heads, block_size, 2*head_size]，
-  key_cache = kv_cache.transpose(1, 2)[..., :D]，value_cache = [..., D:]（视图，按 stride 访问）。
-补丁：FlashAttentionImpl.forward
-  - 纯 decode 步（max_query_len == 1）：全部走本 kernel（CUDA graph 安全，无 CPU 同步）；
-  - 混合步（有 prefill）：先走 vLLM 原生实现，再把开头的 decode token（vLLM 对混合模型会把 decode 排在前面）用本 kernel 覆盖。
-  每个 decode token 永远由本 kernel 算，prefill token 永远由原生实现算，所以与批组成无关。
+Kernel: one program per (request, KV head, segment of SPLIT keys). Segment length is fixed and the number of segments
+  is fixed by the model's max length (independent of the batch; the grid stays the same across CUDA graph replays).
+  Segments are merged in a fixed order.
+  QK^T: q and K are both bf16 -> one bf16 dot, products exact in fp32. The softmax weights p are split into high and
+  low bf16 halves -> two bf16 dots with V (bf16, exact).
+  KV layout follows vLLM FlashAttention: kv_cache [num_blocks, num_kv_heads, block_size, 2*head_size],
+  key_cache = kv_cache.transpose(1, 2)[..., :D], value_cache = [..., D:] (views, accessed through strides).
+Patch: FlashAttentionImpl.forward
+  - pure decode steps (max_query_len == 1): everything goes through this kernel (CUDA-graph safe, no CPU sync);
+  - mixed steps (with prefill): run vLLM's native implementation, then overwrite the leading decode tokens (vLLM puts
+    decodes first for hybrid models) with this kernel.
+  Every decode token is always computed by this kernel and every prefill token by the native implementation, so the
+  result does not depend on batch composition.
 """
 import torch
 import triton
 import triton.language as tl
 
-# kernel 参数是全局常数（不随批变化）。BLK / SPLIT 改变浮点运算顺序，所以一次部署只能用一组；
-# 默认值是在 H200、页大小 528（vLLM 给 Qwen3.5 混合结构选的）上调出来的。由 vllm_exact.enable() 设置。
+# Kernel parameters are global constants (never depend on the batch). BLK / SPLIT change the floating-point order, so
+# a deployment must use one fixed set. Defaults were tuned on H200 with page size 528 (what vLLM picks for the Qwen3.5
+# hybrid architecture). Set by vllm_exact.enable().
 SPLIT = 4096
 BLK = 64
 WARPS = 4
 STAGES = 4
-MAX_LEN = 16384  # 段数按模型最大长度固定；enable() 里设成 max_model_len
+MAX_LEN = 16384  # number of segments is fixed by the model max length; enable() sets it to max_model_len
 
 
 @triton.jit
@@ -91,13 +96,13 @@ def _paged_merge(MP, LP, AP, O, sot, soh, H, NS, D: tl.constexpr):
 
 def paged_decode(query, key_cache, value_cache, block_table, seq_lens, scale, out, n, max_seq_len, blk=None, warps=None,
                  stages=None, split=None):
-    """query: (≥n, H, D)；key/value_cache: (num_blocks, block_size, KV, D) 视图；out: (≥n, H, D)。只算前 n 个请求。"""
+    """query: (>=n, H, D); key/value_cache: (num_blocks, block_size, KV, D) views; out: (>=n, H, D). Computes the first n requests only."""
     H, D = query.shape[1], query.shape[2]
     KV = key_cache.shape[2]
     BS = key_cache.shape[1]
     G = H // KV
     blk, warps, stages, split = blk or BLK, warps or WARPS, stages or STAGES, split or SPLIT
-    NS = max(1, triton.cdiv(MAX_LEN, split))  # 超过序列长度的段直接空转，合并时贡献精确为 0
+    NS = max(1, triton.cdiv(MAX_LEN, split))  # segments past the sequence length do nothing and contribute exactly 0 when merged
     mp = torch.empty(n * H * NS, device=query.device, dtype=torch.float32)
     lp = torch.empty_like(mp)
     ap = torch.empty(n * H * NS * D, device=query.device, dtype=torch.float32)
@@ -128,7 +133,7 @@ def paged_decode_torch(query, key_cache, value_cache, block_table, seq_lens, sca
 
 
 def install():
-    """给 vLLM 的 FlashAttentionImpl.forward 打补丁（需在 LLM 初始化前调用，且 VLLM_ENABLE_V1_MULTIPROCESSING=0）。"""
+    """Patch vLLM's FlashAttentionImpl.forward (call before creating the LLM, with VLLM_ENABLE_V1_MULTIPROCESSING=0)."""
     from vllm.v1.attention.backends import flash_attn as fa
     orig = fa.FlashAttentionImpl.forward
     DEC = fa.AttentionType.DECODER
@@ -148,7 +153,7 @@ def install():
         res = orig(self, layer, query, key, value, kv_cache, attn_metadata, output, output_scale, output_block_scale)
         qsl = attn_metadata.query_start_loc
         ql = (qsl[1:] - qsl[:-1])
-        nd = int(torch.cumprod((ql == 1).to(torch.int32), 0).sum().item())  # 开头连续的 decode 请求数（混合步在 eager 下跑）
+        nd = int(torch.cumprod((ql == 1).to(torch.int32), 0).sum().item())  # number of leading decode requests (mixed steps run eagerly)
         if nd > 0:
             paged_decode(query, key_cache, value_cache, attn_metadata.block_table, attn_metadata.seq_lens,
                          self.scale, out3, nd, attn_metadata.max_seq_len)

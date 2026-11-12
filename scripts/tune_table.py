@@ -1,11 +1,15 @@
-"""为精确插件生成调参表：每个线性层形状 (N, K) × 每档批大小 M，从候选配置里选 GPU 时间最短的。
+"""Build a tuning table for the exact plugin: for each linear-layer shape (N, K) and batch-size bucket M, pick the
+candidate config with the lowest GPU time.
 
 python scripts/tune_table.py OUT.json [--f 14] [--shapes 10240x4096,4096x4096,...]
 
-- 计时把 20 次调用录进 CUDA graph 再回放，只算 GPU 时间（vLLM decode 用 CUDA graph；普通循环在小矩阵上测到的是
-  Python 发射 kernel 的开销，会错误地偏向少发射的配置、选不上 split-K）。
-- 每个候选配置的输出都和第一个配置比对，不逐位相同就报错（整数精确累加与分块无关，应当永远相同）。
-- 默认形状是 Qwen3.5-9B（MiMo-V2.6-Distill-Qwen-9B）的：qkv、o/out_proj、GDN in_proj_qkvz、in_proj_ba、gate_up、down、lm_head。
+- Timing records 20 calls into a CUDA graph and replays it, so only GPU time counts (vLLM decode runs under CUDA
+  graphs; a plain loop on small matrices measures Python kernel-launch overhead, which wrongly favors configs with
+  fewer launches and never picks split-K).
+- Every candidate's output is compared with the first one and must be bitwise identical (exact integer accumulation
+  does not depend on tiling).
+- Default shapes are Qwen3.5-9B (MiMo-V2.6-Distill-Qwen-9B): qkv, o/out_proj, GDN in_proj_qkvz, in_proj_ba, gate_up,
+  down, lm_head.
 """
 import argparse
 import itertools
@@ -68,11 +72,11 @@ def main():
                 try:
                     y = K.exact_linear(xd, wd, F, TR, cfg=c)
                 except Exception:
-                    continue  # 这个配置编译不了（共享内存不够等）
+                    continue  # config does not compile (e.g. not enough shared memory)
                 if ref is None:
                     ref = y
                 elif not torch.equal(y, ref):
-                    raise RuntimeError(f"配置 {c} 改变了结果（N={N} K={Kd} M={M}）")
+                    raise RuntimeError(f"config {c} changed the result (N={N} K={Kd} M={M})")
                 t = bench(lambda c=c: K.exact_linear(xd, wd, F, TR, cfg=c))
                 if best is None or t < best[0]:
                     best = (t, c)

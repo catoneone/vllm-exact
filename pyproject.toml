@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-exact"
 version = "0.1.0"
-description = "让 vLLM 在 Qwen3.5 混合结构上批组成无关（INT8 精确累加线性层 + bf16x2 decode 注意力 + GDN 设置），开销 5–31%"
+description = "Batch-invariant vLLM for the Qwen3.5 hybrid architecture (exact INT8-accumulation linear layers + bf16x2 decode attention + GDN settings), 5-31% overhead"
 requires-python = ">=3.10"
-# 只在 vllm==0.32.0、torch==2.13.0、triton==3.7.1 上测过；补丁依赖 vLLM 内部接口，换版本需要重新验证
+# Tested only with vllm==0.32.0, torch==2.13.0, triton==3.7.1. The patches rely on vLLM internals; re-verify on other versions.
 dependencies = ["vllm==0.32.0"]
 
 [project.optional-dependencies]

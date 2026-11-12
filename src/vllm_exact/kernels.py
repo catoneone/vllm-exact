@@ -1,10 +1,12 @@
-"""INT8 两数位精确累加的线性层：数位化 + 矩阵乘（Triton 版和 torch 参考版）。
+"""Linear layers with exact INT8 two-digit accumulation: digitization + matmul (Triton kernels and torch references).
 
-数值规范：
-- 激活和权重按行做 F 位定点（每行一个 2 的幂缩放），拆成两个 INT8 数位 q = 256·h + l；
-  F = 15 用偏移数位（加行和修正），F = 14 用平衡数位；trunc=True 时丢掉 l·l 项（3 次 INT8 dot）。
-- 乘积在 INT8 张量核里精确，累加用 int32 / int64，整数加法与顺序无关，所以结果与分块方式、split-K 拆法、
-  批大小、批内其他行都无关；最后 int64 → fp64（精确）→ fp32 一次舍入，需要时再转 bf16。
+Numerical spec:
+- Activations and weights are converted per row to F-bit fixed point (one power-of-two scale per row) and split into
+  two INT8 digits q = 256*h + l. F = 15 uses offset digits (with a row-sum correction), F = 14 uses balanced digits;
+  trunc=True drops the l*l term (3 INT8 dots instead of 4).
+- Products are exact in INT8 tensor cores and accumulation is in int32 / int64. Integer addition is exact and
+  order-independent, so the result does not depend on tiling, split-K partitioning, batch size, or the other rows in
+  the batch. Finally int64 -> fp64 (exact) -> fp32 (one rounding), then bf16 if requested.
 """
 import torch
 
@@ -12,20 +14,20 @@ try:
     import triton
     import triton.language as tl
     HAVE_TRITON = torch.cuda.is_available()
-except Exception:  # 本地 CPU
+except Exception:  # CPU-only machine
     HAVE_TRITON = False
 
 
-# ======================= 定点数位化 =======================
+# ======================= fixed-point digitization =======================
 def digitize_torch(x, F):
-    """x: (R, K) fp32 → (h int8, l int8, cs int32 行和修正, sh int32)。与 Triton 版逐位相同。"""
+    """x: (R, K) fp32 -> (h int8, l int8, cs int32 row-sum correction, sh int32). Bitwise identical to the Triton version."""
     x = x.float()
     a = x.abs().amax(dim=1)
     _, e = torch.frexp(a)
     e = torch.where(a > 0, e, torch.zeros_like(e)).to(torch.int32)
     sh = F - e
-    scale = ((sh + 127) << 23).view(torch.float32)  # 2^sh，按位构造，精确
-    q = (x * scale[:, None]).to(torch.int32)  # 2 的幂缩放精确；转 int 向零截断
+    scale = ((sh + 127) << 23).view(torch.float32)  # 2^sh built from bits, exact
+    q = (x * scale[:, None]).to(torch.int32)  # power-of-two scaling is exact; float -> int truncates toward zero
     if F == 15:
         l = (q & 255) - 128
         h = (q - l - 128) >> 8
@@ -83,7 +85,7 @@ def digitize(x, F, out=None):
     return out
 
 
-# ======================= 精确线性层 =======================
+# ======================= exact linear layer =======================
 def exact_linear_torch(xd, wd, F, trunc=False):
     xh, xl, cx, sx = [t.long() for t in xd]
     wh, wl, cw, sw = [t.long() for t in wd]
@@ -104,8 +106,9 @@ if HAVE_TRITON:
                       sxm, swn, som,
                       BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                       TRUNC: tl.constexpr, OFFSET: tl.constexpr, GM: tl.constexpr, SK: tl.constexpr):
-        """SK > 1 时是 split-K：第 pid_k 个程序只累加 K 的 [pid_k·KCH, (pid_k+1)·KCH) 一段，把 int64 部分和写进 WS，
-        再由 _exact_fin 按固定顺序相加。整数加法精确且与顺序无关，所以结果和 SK = 1 逐位相同。"""
+        """SK > 1 is split-K: program pid_k accumulates only K in [pid_k*KCH, (pid_k+1)*KCH) and writes its int64 partial
+        sum to WS; _exact_fin then adds the partials in a fixed order. Integer addition is exact and order-independent,
+        so the result is bitwise identical to SK = 1."""
         pid = tl.program_id(0)
         pid_k = tl.program_id(1)
         npm = tl.cdiv(M, BM)
@@ -116,7 +119,7 @@ if HAVE_TRITON:
         gsz = tl.minimum(npm - first_m, GM)
         pid_m = first_m + (pid % width) % gsz
         pid_n = (pid % width) // gsz
-        rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # int64：M×N 超过 2^31 时地址不溢出
+        rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # int64 so addresses do not overflow when M*N > 2^31
         rn = (pid_n * BN + tl.arange(0, BN)).to(tl.int64)
         rk = tl.arange(0, BK)
         hh = tl.zeros((BM, BN), dtype=tl.int32)
@@ -150,7 +153,7 @@ if HAVE_TRITON:
             sw = tl.load(SW + rn, mask=rn < N, other=0)
             e = (-(sx[:, None] + sw[None, :])).to(tl.int64)
             scale = ((e + 1023) << 52).to(tl.float64, bitcast=True)
-            out = (tot.to(tl.float64) * scale).to(tl.float32)  # fp64 精确 → fp32 一次舍入；输出 bf16 时再舍入一次（和先出 fp32 再转逐位相同）
+            out = (tot.to(tl.float64) * scale).to(tl.float32)  # fp64 exact -> fp32 one rounding; bf16 output rounds once more (same bits as fp32 output then cast)
             tl.store(OUT + rm[:, None] * som + rn[None, :], out.to(OUT.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
     @triton.jit

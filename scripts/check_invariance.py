@@ -1,16 +1,19 @@
-"""批组成无关测试 + decode 测速。
+"""Batch-invariance check + decode speed.
 
 python scripts/check_invariance.py MODEL_DIR [--mode exact|vllm-bi|base] [--texts T.jsonl.gz] [--speed] [--out OUT.json]
 
 mode：
-  exact    vllm_exact.enable()（默认）
-  vllm-bi  只开 vLLM 自带的确定性模式（不改 GDN 等，用来对照；vLLM 0.32 在 GDN 模型上会直接报错）
-  base     正常 vLLM
-测试：16 条目标序列（prompt 各 1,024 token，种子固定，各生成 256 token），
-  A = 只放这 16 条；B = 穿插进 64 条的批里；C = 再单独跑一次。
-  比较生成的 token 和每个 token 的 logprob 是否逐位相同；温度 1.0（top_k 20、top_p 0.95）和 0（贪心）各一次。
---texts：jsonl.gz，每行 {"prompt_ids": [...], "out_ids": [...]}，拼起来截成需要的长度；不给就用固定种子的随机 token。
---speed：稳态 decode 单步 = (t(321) − t(65)) / 256，各取两次的最小值；场景 (批 256, 1K)、(64, 8K)、(16, 16K)。
+  exact    vllm_exact.enable() (default)
+  vllm-bi  vLLM's own batch-invariant mode only (for comparison; vLLM 0.32 refuses to start on GDN models)
+  base     plain vLLM
+Check: 16 target sequences (1,024-token prompts, fixed seeds, 256 generated tokens each).
+  A = the 16 alone; B = interleaved into a batch of 64; C = the 16 alone again.
+  Compares generated tokens and per-token logprobs bitwise; once at temperature 1.0 (top_k 20, top_p 0.95) and once
+  greedy.
+--texts: jsonl.gz, one {"prompt_ids": [...], "out_ids": [...]} per line, concatenated and cut to length; without it,
+  random tokens with a fixed seed.
+--speed: steady-state decode step = (t(321) - t(65)) / 256, min of two runs each; scenarios (batch 256, 1K),
+  (64, 8K), (16, 16K).
 """
 import argparse
 import gzip
@@ -80,7 +83,7 @@ def main():
     P = build_prompts(64, 1024)
     tgt, oth = P[:16], P[16:]
     order, tpos = [], []
-    for j in range(16):  # 目标穿插：t0, o0, o1, o2, t1, o3, ...
+    for j in range(16):  # interleave targets: t0, o0, o1, o2, t1, o3, ...
         tpos.append(len(order))
         order.append(tgt[j])
         order += oth[3 * j:3 * j + 3]

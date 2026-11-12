@@ -1,17 +1,18 @@
-"""GPU 单元测试（需要 CUDA + Triton）：python -m pytest tests/test_gpu.py
-不需要 vLLM：只测 kernels 和 paged_attn 的 kernel 本身。
+"""GPU unit tests (need CUDA + Triton): python -m pytest tests/test_gpu.py
+vLLM is not needed: only the kernels in kernels.py and paged_attn.py are tested.
 """
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 GPU")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 DEV = "cuda"
 
 
 @pytest.mark.parametrize("F,tr", [(14, True), (15, False)])
 @pytest.mark.parametrize("M,N,Kd", [(24, 384, 4096), (5, 200, 12288), (1, 64, 4096)])
 def test_exact_linear_split_k_bitwise(F, tr, M, N, Kd):
-    """任何分块配置、任何 split-K 拆法都和 CPU int64 参考逐位相同；直接写 bf16 和先出 fp32 再转逐位相同。"""
+    """Every tiling config and every split-K partition is bitwise identical to the CPU int64 reference; bf16 output is
+    bitwise identical to fp32 output cast to bf16."""
     from vllm_exact import kernels as K
     g = torch.Generator(device=DEV).manual_seed(0)
     x = torch.randn(M, Kd, device=DEV, generator=g)
@@ -52,7 +53,8 @@ def _make(B, L, BS, H=16, KV=4, D=256, seed=0):
 
 @pytest.mark.parametrize("B,L,BS", [(8, 300, 16), (8, 5000, 528), (4, 9000, 528), (64, 8192, 528)])
 def test_paged_attention(B, L, BS):
-    """误差 vs fp32 参考；只算前 n 个请求时前 n 个逐位不变；物理页搬家（块表跟着改）逐位不变。"""
+    """Error vs an fp32 reference; computing only the first n requests leaves them bitwise unchanged; moving physical
+    pages (with the block table updated) leaves the output bitwise unchanged."""
     from vllm_exact import paged_attn as P
     q, kv, bt, sl = _make(B, L, BS)
     kc, vc = kv.transpose(1, 2).split(256, dim=-1)
