@@ -7,6 +7,7 @@ name = "vllm-exact"
 version = "0.1.0"
 description = "Batch-invariant vLLM for the Qwen3.5 hybrid architecture (exact INT8-accumulation linear layers + bf16x2 decode attention + GDN settings), 5-31% overhead"
 requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
 # Tested only with vllm==0.32.0, torch==2.13.0, triton==3.7.1. The patches rely on vLLM internals; re-verify on other versions.
 dependencies = ["vllm==0.32.0"]
 

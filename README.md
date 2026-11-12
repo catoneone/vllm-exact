@@ -93,3 +93,7 @@ scripts/check_invariance.py        batch invariance + speed
 scripts/tune_table.py              build a tuning table
 tests/                             CPU / GPU unit tests
 ```
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
