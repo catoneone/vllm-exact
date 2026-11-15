@@ -8,6 +8,7 @@ python scripts/tune_table.py OUT.json [--f 14] [--shapes 10240x4096,4096x4096,..
   fewer launches and never picks split-K).
 - Every candidate's output is compared with the first one and must be bitwise identical (exact integer accumulation
   does not depend on tiling).
+- Both INT8 and bf16 tensor-core kernels are candidates (same result bits); the table records the choice.
 - Default shapes are Qwen3.5-9B (MiMo-V2.6-Distill-Qwen-9B): qkv, o/out_proj, GDN in_proj_qkvz, in_proj_ba, gate_up,
   down, lm_head.
 """
@@ -22,6 +23,7 @@ from vllm_exact import kernels as K
 ap = argparse.ArgumentParser()
 ap.add_argument("out")
 ap.add_argument("--f", type=int, default=14)
+ap.add_argument("--mma", default="both", choices=["both", "int8", "bf16"], help="tensor cores to consider")
 ap.add_argument("--shapes", default="10240x4096,4096x4096,12288x4096,64x4096,24576x4096,4096x12288,248320x4096")
 args = ap.parse_args()
 F, TR = args.f, args.f == 14
@@ -29,7 +31,8 @@ SHAPES = [tuple(map(int, s.split("x"))) for s in args.shapes.split(",")]
 MS = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 512]
 BASE = sorted(set([c[:6] for c in K.EXACT_CFGS] + [(bm, bn, bk, w, st, 8) for bm, bn, bk, w, st in itertools.product(
     (16, 32, 64), (64, 128, 256), (128, 256), (4, 8), (3, 4))]))
-CFGS = [c + (sk,) for c in BASE for sk in (1, 2, 4, 8)]
+MMAS = {"both": (0, 1), "int8": (0,), "bf16": (1,)}[args.mma]
+CFGS = [c + (sk, mma) for c in BASE for sk in (1, 2, 4, 8) for mma in MMAS]
 
 
 def bench(fn, n=20):
@@ -63,7 +66,7 @@ def main():
         for M in MS:
             x = torch.randn(M, Kd, device="cuda", generator=gen)
             xd = K.digitize(x, F)
-            ref, best = None, None
+            ref, best, tried = None, None, []
             for c in CFGS:
                 if c[0] > max(16, 1 << (M - 1).bit_length()):
                     continue
@@ -78,12 +81,15 @@ def main():
                 elif not torch.equal(y, ref):
                     raise RuntimeError(f"config {c} changed the result (N={N} K={Kd} M={M})")
                 t = bench(lambda c=c: K.exact_linear(xd, wd, F, TR, cfg=c))
+                tried.append((t, c))
                 if best is None or t < best[0]:
                     best = (t, c)
             xb, wb = x.to(torch.bfloat16), w.to(torch.bfloat16)
             bt = bench(lambda: xb @ wb.T)
             table.setdefault(f"{N},{Kd}", {})[str(M)] = list(best[1])
-            report.append(dict(N=N, K=Kd, M=M, exact_us=best[0], cublas_bf16_us=bt, cfg=best[1]))
+            best_by = {m: min((t for t, c in tried if c[7] == m), default=None) for m in MMAS}
+            report.append(dict(N=N, K=Kd, M=M, exact_us=best[0], cublas_bf16_us=bt, cfg=best[1],
+                               int8_us=best_by.get(0), bf16_us=best_by.get(1)))
             print(report[-1], flush=True)
     json.dump(table, open(args.out, "w"), indent=1)
     json.dump(report, open(args.out.replace(".json", "_report.json"), "w"), indent=1)

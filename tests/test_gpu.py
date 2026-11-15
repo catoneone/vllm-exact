@@ -1,6 +1,8 @@
 """GPU unit tests (need CUDA + Triton): python -m pytest tests/test_gpu.py
 vLLM is not needed: only the kernels in kernels.py and paged_attn.py are tested.
 """
+import itertools
+
 import pytest
 import torch
 
@@ -9,7 +11,7 @@ DEV = "cuda"
 
 
 @pytest.mark.parametrize("F,tr", [(14, True), (15, False)])
-@pytest.mark.parametrize("M,N,Kd", [(24, 384, 4096), (5, 200, 12288), (1, 64, 4096)])
+@pytest.mark.parametrize("M,N,Kd", [(24, 384, 4096), (5, 200, 12288), (1, 64, 4096), (300, 256, 12288)])
 def test_exact_linear_split_k_bitwise(F, tr, M, N, Kd):
     """Every tiling config and every split-K partition is bitwise identical to the CPU int64 reference; bf16 output is
     bitwise identical to fp32 output cast to bf16."""
@@ -18,10 +20,11 @@ def test_exact_linear_split_k_bitwise(F, tr, M, N, Kd):
     x = torch.randn(M, Kd, device=DEV, generator=g)
     x[:, 7] *= 300
     w = torch.randn(N, Kd, device=DEV, generator=g) * 0.02
+    w[:, 3] *= 300  # digits near the extremes (|d| close to 128), to stress the exactness bounds of the bf16 path
     xd, wd = K.digitize(x, F), K.digitize(w, F)
     ref = K.exact_linear_torch([t.cpu() for t in xd], [t.cpu() for t in wd], F, tr)
-    for sk in (1, 2, 4, 8):
-        for cfg in ((16, 64, 128, 4, 3, 8, sk), (64, 128, 128, 4, 4, 8, sk), (16, 128, 256, 8, 3, 8, sk)):
+    for sk, mma in itertools.product((1, 2, 4, 8), (0, 1)):  # mma 0 = INT8 tensor cores, 1 = bf16 tensor cores
+        for cfg in ((16, 64, 128, 4, 3, 8, sk, mma), (64, 128, 128, 4, 4, 8, sk, mma), (16, 128, 256, 8, 3, 8, sk, mma)):
             y = K.exact_linear(xd, wd, F, tr, cfg=cfg)
             assert torch.equal(y.cpu(), ref), cfg
             yb = torch.empty(M, N, device=DEV, dtype=torch.bfloat16)

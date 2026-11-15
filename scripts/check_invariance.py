@@ -30,12 +30,15 @@ ap.add_argument("--speed", action="store_true")
 ap.add_argument("--speed-only", action="store_true")
 ap.add_argument("--out", default="invariance.json")
 ap.add_argument("--max-model-len", type=int, default=16384 + 400)
+ap.add_argument("--cfg-table", default="h200", help='tuning table for the exact plugin: "h200", a path, or "none"')
+ap.add_argument("--no-attention", action="store_true", help="keep vLLM's batch-invariant attention instead of the bf16x2 kernel")
 args = ap.parse_args()
 
 kw = {}
 if args.mode == "exact":
     import vllm_exact
-    kw = vllm_exact.enable(max_model_len=args.max_model_len)
+    kw = vllm_exact.enable(max_model_len=args.max_model_len, attention=not args.no_attention,
+                           cfg_table=None if args.cfg_table == "none" else args.cfg_table)
 elif args.mode == "vllm-bi":
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 from vllm import LLM, SamplingParams  # noqa: E402

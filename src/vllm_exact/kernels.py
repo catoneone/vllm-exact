@@ -177,6 +177,76 @@ if HAVE_TRITON:
         tl.store(OUT + r * som + c, out.to(OUT.dtype.element_ty), mask=msk)
 
 
+if HAVE_TRITON:
+    @triton.jit
+    def _exact_bf16_kernel(XH, XL, WH, WL, CX, CW, SX, SW, OUT, WS, M, N, K, kconst, KCH, MN,
+                           sxm, swn, som,
+                           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                           TRUNC: tl.constexpr, OFFSET: tl.constexpr, GM: tl.constexpr, SK: tl.constexpr,
+                           KMAX: tl.constexpr):
+        """Same digits and same result bits as _exact_kernel, computed with bf16 tensor cores instead of INT8 ones
+        (for GPUs with weak INT8 throughput, e.g. B300). INT8 digits (|d| <= 128) convert to bf16 exactly; each digit
+        product is an integer of at most 2^14 (2^13 for the terms kept by F=14 truncation), and each fp32 accumulator
+        only sums KMAX terms before being moved into an int32 accumulator, so every partial sum is an integer of
+        magnitude <= 2^24 and is exact in fp32. With split-K chunks of <= KMAX the inner readout happens only once."""
+        pid = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        npm = tl.cdiv(M, BM)
+        npn = tl.cdiv(N, BN)
+        width = GM * npn
+        gid = pid // width
+        first_m = gid * GM
+        gsz = tl.minimum(npm - first_m, GM)
+        pid_m = first_m + (pid % width) % gsz
+        pid_n = (pid % width) // gsz
+        rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)
+        rn = (pid_n * BN + tl.arange(0, BN)).to(tl.int64)
+        rk = tl.arange(0, BK)
+        hh = tl.zeros((BM, BN), dtype=tl.int32)
+        md = tl.zeros((BM, BN), dtype=tl.int32)
+        ll = tl.zeros((BM, BN), dtype=tl.int32)
+        k_lo = pid_k * KCH
+        k_hi = tl.minimum(k_lo + KCH, K)
+        for c0 in range(k_lo, k_hi, KMAX):
+            c1 = tl.minimum(c0 + KMAX, k_hi)
+            fh = tl.zeros((BM, BN), dtype=tl.float32)
+            f1 = tl.zeros((BM, BN), dtype=tl.float32)
+            f2 = tl.zeros((BM, BN), dtype=tl.float32)
+            fl = tl.zeros((BM, BN), dtype=tl.float32)
+            for k0 in range(c0, c1, BK):
+                kk = k0 + rk
+                mx = (rm[:, None] < M) & (kk[None, :] < K)
+                mw = (kk[:, None] < K) & (rn[None, :] < N)
+                xh = tl.load(XH + rm[:, None] * sxm + kk[None, :], mask=mx, other=0).to(tl.bfloat16)
+                xl = tl.load(XL + rm[:, None] * sxm + kk[None, :], mask=mx, other=0).to(tl.bfloat16)
+                wh = tl.load(WH + rn[None, :] * swn + kk[:, None], mask=mw, other=0).to(tl.bfloat16)
+                wl = tl.load(WL + rn[None, :] * swn + kk[:, None], mask=mw, other=0).to(tl.bfloat16)
+                fh = tl.dot(xh, wh, fh)
+                f1 = tl.dot(xh, wl, f1)
+                f2 = tl.dot(xl, wh, f2)
+                if not TRUNC:
+                    fl = tl.dot(xl, wl, fl)
+            hh += fh.to(tl.int32)
+            md += f1.to(tl.int32) + f2.to(tl.int32)
+            if not TRUNC:
+                ll += fl.to(tl.int32)
+        tot = (hh.to(tl.int64) << 16) + (md.to(tl.int64) << 8) + ll.to(tl.int64)
+        if SK > 1:
+            wsp = WS + pid_k.to(tl.int64) * MN + rm[:, None] * N + rn[None, :]
+            tl.store(wsp, tot, mask=(rm[:, None] < M) & (rn[None, :] < N))
+        else:
+            if OFFSET:
+                cx = tl.load(CX + rm, mask=rm < M, other=0).to(tl.int64)
+                cw = tl.load(CW + rn, mask=rn < N, other=0).to(tl.int64)
+                tot += 128 * (cx[:, None] + cw[None, :]) + kconst
+            sx = tl.load(SX + rm, mask=rm < M, other=0)
+            sw = tl.load(SW + rn, mask=rn < N, other=0)
+            e = (-(sx[:, None] + sw[None, :])).to(tl.int64)
+            scale = ((e + 1023) << 52).to(tl.float64, bitcast=True)
+            out = (tot.to(tl.float64) * scale).to(tl.float32)
+            tl.store(OUT + rm[:, None] * som + rn[None, :], out.to(OUT.dtype.element_ty), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
 EXACT_CFGS = [(64, 128, 128, 4, 4, 8), (64, 64, 128, 4, 5, 8), (128, 128, 128, 8, 3, 8), (128, 64, 128, 4, 4, 8),
               (64, 256, 128, 8, 3, 8), (32, 128, 128, 4, 4, 8), (16, 128, 128, 4, 4, 8), (16, 256, 128, 8, 3, 8),
               (128, 128, 64, 4, 4, 8), (128, 256, 64, 8, 3, 8), (64, 128, 256, 4, 3, 8), (128, 128, 256, 8, 2, 8),
@@ -197,13 +267,21 @@ def exact_linear(xd, wd, F, trunc=False, out=None, cfg=None):
     cfg = cfg or _CFG_CACHE.get(key) or autotune_exact(xd, wd, F, trunc)
     BM, BN, BK, warps, stages, GM = cfg[:6]
     SK = cfg[6] if len(cfg) > 6 else 1
+    BF16 = len(cfg) > 7 and cfg[7] == 1  # 1 = bf16 tensor cores (same result bits), 0 = INT8 tensor cores
     KCH = triton.cdiv(triton.cdiv(K, SK), BK) * BK
     SK = triton.cdiv(K, KCH)
     ws = torch.empty((SK, M, N), device=xh.device, dtype=torch.int64) if SK > 1 else out
     grid = (triton.cdiv(M, BM) * triton.cdiv(N, BN), SK)
-    _exact_kernel[grid](xh, xl, wh, wl, cx, cw, sx, sw, out, ws, M, N, K, 128 * 128 * K, KCH, M * N,
-                        xh.stride(0), wh.stride(0), out.stride(0),
-                        BM=BM, BN=BN, BK=BK, TRUNC=trunc, OFFSET=(F == 15), GM=GM, SK=SK, num_warps=warps, num_stages=stages)
+    args = (xh, xl, wh, wl, cx, cw, sx, sw, out, ws, M, N, K, 128 * 128 * K, KCH, M * N, xh.stride(0), wh.stride(0), out.stride(0))
+    if BF16:
+        # largest digit product: 2^13 for the terms kept by F=14 truncation, 2^14 otherwise; sums must stay <= 2^24
+        KMAX = 2048 if (F == 14 and trunc) else 1024
+        assert KMAX % BK == 0
+        _exact_bf16_kernel[grid](*args, BM=BM, BN=BN, BK=BK, TRUNC=trunc, OFFSET=(F == 15), GM=GM, SK=SK, KMAX=KMAX,
+                                 num_warps=warps, num_stages=stages)
+    else:
+        _exact_kernel[grid](*args, BM=BM, BN=BN, BK=BK, TRUNC=trunc, OFFSET=(F == 15), GM=GM, SK=SK,
+                            num_warps=warps, num_stages=stages)
     if SK > 1:
         BLOCK = 1024
         _exact_fin[(triton.cdiv(M * N, BLOCK),)](ws, cx, cw, sx, sw, out, M * N, N, 128 * 128 * K, out.stride(0),

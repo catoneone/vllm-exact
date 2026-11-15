@@ -4,7 +4,7 @@ Makes vLLM **batch-invariant** on the Qwen3.5 hybrid architecture (Gated DeltaNe
 
 Use it when inference results have to be reproducible as evidence, for example when other parties run evaluations and you spot-check their results by recomputing them.
 
-> Tested only on **vLLM 0.32.0 / torch 2.13.0 / triton 3.7.1 / a single H200**. The patches rely on vLLM internals; re-verify before using other versions.
+> Tested only with **vLLM 0.32.0 / torch 2.13.0 / triton 3.7.1** on a single **H200** (fast) and a single **B300** (correct but slow, see below). The patches rely on vLLM internals; re-verify before using other versions.
 
 ## Results (H200, MiMo-V2.6-Distill-Qwen-9B, bf16)
 
@@ -31,6 +31,19 @@ Re-verified on another H200 after installing as described below: all 16 tests in
 
 The second row is vLLM's batch-invariant mode plus the settings in item 1 below (also 16 / 16 bitwise identical), measured on another H200 of the same type.
 
+### B300 (Blackwell Ultra): correct, but slow for now
+
+- All 18 tests pass, including the bf16 tensor-core path (every split-K partition and tiling bitwise equal to the CPU integer reference), and `check_invariance.py` gives 16 / 16 bitwise identical at both temperatures. The bf16x2 attention patch works on Blackwell too.
+- Decode step (ms), `enable(cfg_table="b300")`:
+
+| | batch 256, 1K | batch 64, 8K | batch 16, 16K |
+|---|---|---|---|
+| Plain vLLM (B300) | 17.4 | 8.2 | 6.0 |
+| vllm-exact (B300) | 43.8 (+151%) | 19.0 (+132%) | not measured |
+
+- Why: B300's INT8 tensor cores are weak, so the table picks the bf16 tensor-core kernel (1.2–2× faster than INT8 there, same bits). But the Triton kernel still reaches only ~2.6 TB/s at small batch (cuBLAS bf16: ~6.5 TB/s) and ~0.27 PFLOPS at batch 256 (cuBLAS: ~1.4), most likely because operands converted in registers keep Triton from using Blackwell's tcgen05 instructions. A swap-AB variant did not help. Summed over the model's layers, the exact matmuls explain the whole gap.
+- The fix is a Blackwell-native exact kernel (TMA loads, tcgen05 bf16 MMA, fp32 accumulators in tensor memory read out every 2,048 terms). Since every exact implementation produces the same bits, such a kernel, or different kernels for prefill and decode, can be dropped in without changing any result. Not done yet.
+
 ## Usage
 
 ```python
@@ -55,7 +68,8 @@ Batch dependence comes from floating-point addition not being associative: when 
 1. **vLLM settings** (`enable()`): turn on vLLM's batch-invariant mode; bypass its check on the GDN backend; never chunk prompts (where a prompt is cut changes GDN's chunking); use the Triton backend for GDN prefill; turn off prefix caching. Not chunking and the Triton backend are both needed together; their individual effects were not separated. These settings alone already make vLLM batch-invariant, but 2.7× slower at small batch and long context, because vLLM's batch-invariant matmul is slow.
 2. **Exact INT8-accumulation linear layers** (`plugin.py`, `kernels.py`, `quantization="exact_int8"`): for every linear layer and lm_head, activations and weights are converted per row to 14-bit fixed point and split into two INT8 digits, multiplied in INT8 tensor cores and accumulated in integers. Integer addition is exact and order-independent, so the result does not depend on tiling, batch size or split-K partitioning. The output path is int64 → fp64 (exact) → fp32 → bf16. The 14-bit truncated variant drops the low × low term and needs only 3 INT8 dots. The two digits of a weight take 2 bytes, so weight traffic equals bf16.
    - Split-K: integer partial sums can be added in any partition without changing a bit, so small matrices can split K across programs for more parallelism. Floating point cannot do this.
-   - Tuning table (`cfg_table_h200_F14.json`): the fastest kernel config for each (output dim, input dim, batch size). It affects speed only, never results.
+   - Two kernels with identical result bits: INT8 tensor cores (default; best on H200), or bf16 tensor cores for GPUs with weak INT8 throughput such as B300. In the bf16 kernel the INT8 digits are converted to bf16 exactly (|digit| ≤ 128), every digit product is an integer ≤ 2^13 (for the terms kept by 14-bit truncation), and each fp32 accumulator sums at most 2,048 terms before moving into an int32 accumulator, so every partial sum is an integer ≤ 2^24 and exact in fp32.
+   - Tuning tables (`cfg_table_h200_F14.json`, `cfg_table_b300_F14.json`): the fastest kernel config for each (output dim, input dim, batch size): `[BM, BN, BK, warps, stages, GM, split_k, mma]`, where `mma` 0 = INT8 and 1 = bf16 tensor cores. They affect speed only, never results.
 3. **bf16x2 decode attention** (`paged_attn.py`): reads vLLM's paged KV cache directly. QKᵀ is one bf16 dot (q and K are bf16; the products are exact in fp32). The softmax weights are split into high and low bf16 halves for two bf16 dots with V. Each request is split into fixed-length segments merged in a fixed order, independent of the batch. Reaches 4.0–4.1 TB/s on H200, close to the bandwidth limit.
 4. **Patch**: `FlashAttentionImpl.forward` is patched so decode tokens always go through the kernel in item 3 and prefill tokens always go through vLLM's native implementation (in batch-invariant mode).
 
@@ -65,16 +79,17 @@ Batch dependence comes from floating-point addition not being associative: when 
 python -m pytest tests/test_reference_cpu.py     # CPU: self-checks of the reference implementation
 python -m pytest tests/test_gpu.py               # GPU: every split-K partition bitwise equal to the CPU integer reference; attention error and bitwise invariance
 python scripts/check_invariance.py MODEL_DIR --speed   # end to end: batch invariance + decode speed
-python scripts/tune_table.py my_table.json       # rebuild the tuning table for another GPU or model
+python scripts/tune_table.py my_table.json       # rebuild the tuning table for another GPU or model (--mma both|int8|bf16)
 ```
 
-`check_invariance.py --mode base` / `--mode vllm-bi` compare against plain vLLM and vLLM's own batch-invariant mode. Without `--texts`, prompts are random tokens with a fixed seed.
+`check_invariance.py --mode base` / `--mode vllm-bi` compare against plain vLLM and vLLM's own batch-invariant mode; `--cfg-table h200|b300|PATH|none` picks the tuning table. Without `--texts`, prompts are random tokens with a fixed seed.
 
 Tune with CUDA-graph timing (the script does this): a plain timing loop on small matrices measures Python kernel-launch overhead and never picks split-K.
 
 ## Not covered
 
-- **Cross-GPU consistency**: the exact linear layers are hardware-independent, but vLLM's GDN, normalization, prefill attention and sampling are still floating point. Bitwise identity is only guaranteed on the same GPU type with the same software versions.
+- **Cross-GPU consistency**: the exact linear layers are hardware-independent (the INT8 kernel on H200 and the bf16 kernel on B300 give the same bits), but vLLM's GDN, normalization, attention and sampling are still floating point. Bitwise identity of whole generations is only guaranteed on the same GPU type with the same software versions.
+- **B300 speed**: see above; the batch 16 / 16K scenario was not measured, the attention kernel was not tuned for B300, and the B300 table only covers batch-size buckets 1 / 16 / 64 / 256.
 - **Accuracy**: KL against an fp32 reference has not been measured inside vLLM. In a separate deterministic engine (15-bit, untruncated) the mean KL was 4.1e-4, versus 1.5e-3 for bf16 inference. The accuracy of the 14-bit truncated variant has not been measured separately.
 - **Prefill speed**: only decode was measured.
 - **Multi-GPU / tensor parallelism** and other architectures: not tested.
@@ -89,6 +104,7 @@ src/vllm_exact/plugin.py           quantization="exact_int8" (linear layers + lm
 src/vllm_exact/kernels.py          digitization and exact matmul (with split-K): Triton kernels and torch references
 src/vllm_exact/paged_attn.py       paged bf16x2 decode attention + FlashAttentionImpl patch
 src/vllm_exact/cfg_table_h200_F14.json   H200 tuning table
+src/vllm_exact/cfg_table_b300_F14.json   B300 tuning table (quick)
 scripts/check_invariance.py        batch invariance + speed
 scripts/tune_table.py              build a tuning table
 tests/                             CPU / GPU unit tests

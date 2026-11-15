@@ -26,7 +26,7 @@ from pathlib import Path
 
 __version__ = "0.1.0"
 _ENABLED = False
-TABLES = {"h200": Path(__file__).with_name("cfg_table_h200_F14.json")}
+TABLES = {"h200": Path(__file__).with_name("cfg_table_h200_F14.json"), "b300": Path(__file__).with_name("cfg_table_b300_F14.json")}
 
 
 def enable(max_model_len, f=14, lm_head=True, attention=True, cfg_table="h200", max_num_batched_tokens=131072):
@@ -34,8 +34,9 @@ def enable(max_model_len, f=14, lm_head=True, attention=True, cfg_table="h200", 
 
     max_model_len: same value as passed to LLM (the attention kernel fixes its number of segments from it).
     f: 14 (truncated, 3 INT8 dots; default and fastest) or 15 (4 dots).
-    cfg_table: "h200" (shipped, tuned on H200 with CUDA-graph timing), a path to your own table, or None (three built-in
-      configs). The table only affects speed, never results. It only has F=14 entries; with f=15 pass None or tune.
+    cfg_table: "h200" or "b300" (shipped, tuned with CUDA-graph timing; the B300 one is a quick tune with 4 batch-size
+      buckets and picks the bf16 tensor-core kernel), a path to your own table, or None (three built-in INT8 configs).
+      The table only affects speed, never results. Tables only have F=14 entries; with f=15 pass None or tune.
     max_num_batched_tokens: must exceed the length of every prompt (when a prompt is chunked, GDN numerics depend on
       where the chunks fall).
     """
